@@ -1,0 +1,57 @@
+# GANShield-IDS: Comprehensive System Context & Architecture
+
+This document provides a highly detailed breakdown of the GANShield-IDS project. It is intended to be provided as context to AI assistants to help them understand the exact architecture, algorithms, and data pipelines powering the system.
+
+## 1. System Overview
+GANShield-IDS is a full-stack, AI-powered Intrusion Detection System (IDS) capable of capturing live network traffic, extracting features, and classifying attacks in real time. The system completely bypasses legacy Java-based tools (like CICFlowMeter) in favor of a modern, pure-Python data processing pipeline.
+
+## 2. Machine Learning Algorithm & Model
+- **Algorithm:** XGBoost Classifier.
+- **Dataset:** Trained on the CICIDS2018 dataset.
+- **Classes:** Capable of classifying 12 categories: Benign, Bot, DDoS attacks-LOIC-HTTP, DoS attacks-GoldenEye, DoS attacks-Hulk, DoS attacks-SlowHTTPTest, DoS attacks-Slowloris, FTP-BruteForce, Infilteration, SFTP-BruteForce, SQL Injection, SSH-Bruteforce.
+- **Preprocessing:** 
+  - Uses `LabelEncoder` to decode the numerical predictions back into human-readable attack labels.
+- **Inference Engine:** Managed by `backend/predictor.py` which loads the `.json` XGBoost model and `.pkl` scalers/encoders.
+
+## 3. Real-Time Packet Processing Pipeline (The Core Engine)
+The system operates asynchronously through a series of decoupled scripts watching directories:
+
+1. **Packet Capture (`backend/packet_capture.py`)**
+   - Uses the `Scapy` library (requires Npcap on Windows) to sniff raw network packets directly from the Network Interface Card (NIC).
+   - Dumps the captured packets into a `.pcap` file inside `backend/pcap_output/` periodically (e.g., every 10 seconds, giving TCP flows time to finish).
+
+2. **PCAP Watcher & Converter (`backend/pcap_watcher.py` & `backend/pcap_to_csv.py`)**
+   - `pcap_watcher.py` uses the `watchdog` library to monitor `backend/pcap_output/`.
+   - When a new `.pcap` file is saved, it triggers `pcap_to_csv.py` on a background thread.
+   - `pcap_to_csv.py` is a custom, pure-Python script that extracts 80+ flow statistical features (identical to the CICFlowMeter standard) from the packets.
+   - The resulting features are saved as a `.csv` file in `backend/flow_output/`.
+   - *Note: This pure-Python approach replaces the old dependency on the Java-based CICFlowMeter tool, ensuring seamless Windows compatibility without tcpdump.*
+
+3. **CSV Watcher & Storage Optimizer (`backend/watcher.py`)**
+   - Uses `watchdog` to monitor `backend/flow_output/` for new CSV files.
+   - For every new flow row, it maps the columns to the expected model features and sends a `POST /predict/live` request to the FastAPI backend.
+   - **Storage Optimization:** To prevent disk saturation, it maintains only the last 5 generated CSV and PCAP files. 
+   - **Attack Archiving:** If a file contains a malicious flow, the CSV and corresponding PCAP are moved to `backend/attack_log/` for forensic analysis. If it is entirely benign, it is permanently deleted.
+
+## 4. Backend Architecture (FastAPI)
+- **Framework:** FastAPI running on Uvicorn.
+- **Database:** SQLite managed via SQLAlchemy ORM (`backend/database.py`).
+- **Authentication:** JWT (JSON Web Tokens) with hashed passwords (`passlib/bcrypt`) inside `backend/auth.py`.
+- **Key Endpoints:**
+  - `POST /predict/live`: Receives flow features from `watcher.py`, runs ML inference, saves the `FlowLog` to the SQLite DB, and broadcasts the result.
+  - `POST /capture/start` & `POST /capture/stop`: APIs to start/stop the `packet_capture.py` and `pcap_watcher.py` threads.
+  - `GET /stats` & `GET /logs`: Fetch historical data and aggregated analytics for the frontend dashboard.
+  - `WS /ws/live`: WebSocket endpoint for real-time frontend updates.
+
+## 5. Frontend Architecture (React + Vite)
+- **Framework:** React 19 + Vite.
+- **Styling & UI:** TailwindCSS v4, Framer Motion   (for micro-animations like spinning shields and glowing cards), and Lucide React icons.
+- **Data Visualization:** Recharts for dynamic dashboard analytics.
+- **State & Connection:** Custom hooks (`useWebSocket.js`) manage the auto-reconnecting WebSocket stream, instantly updating the UI when the backend broadcasts a new attack detection.
+
+## 6. Directory Structure Context
+- `backend/model/`: Contains `xgb_IDS_model_fixed.json`, `scaler.pkl`, `encoder.pkl`.
+- `backend/pcap_output/`: Temporary holding for raw `.pcap` files.
+- `backend/flow_output/`: Temporary holding for processed `.csv` files.
+- `backend/attack_log/`: Permanent archive for `.pcap` and `.csv` files that contained attacks.
+- `backend/ganshield.db`: The SQLite database.
