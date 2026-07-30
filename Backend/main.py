@@ -198,6 +198,66 @@ async def predict_live(payload: LivePredictionPayload, db: Session = Depends(get
     return result
 
 
+@app.post("/predict/live/batch")
+async def predict_live_batch(payloads: List[LivePredictionPayload], db: Session = Depends(get_db)):
+    if not predictor.is_ready:
+        raise HTTPException(status_code=503, detail="ML model not loaded")
+
+    if not payloads:
+        return {"status": "empty", "processed": 0}
+
+    features_list = [p.features.model_dump() for p in payloads]
+    predictions = predictor.predict_batch(features_list)
+    ts = datetime.now(timezone.utc)
+    
+    logs = []
+    results = []
+    
+    for i, payload in enumerate(payloads):
+        features = features_list[i]
+        pred = predictions[i]
+        
+        log = FlowLog(
+            timestamp=ts,
+            label=pred["label"],
+            confidence=pred["confidence"],
+            is_attack=pred["is_attack"],
+            src_ip=payload.src_ip,
+            dst_ip=payload.dst_ip,
+            src_port=payload.src_port,
+            dst_port=int(features.get("dst_port", 0)),
+            protocol=payload.protocol,
+            raw_features=json.dumps(features),
+        )
+        logs.append(log)
+        
+    db.add_all(logs)
+    db.commit()
+    
+    for i, log in enumerate(logs):
+        pred = predictions[i]
+        payload = payloads[i]
+        features = features_list[i]
+        
+        result = {
+            "id": log.id,
+            "label": pred["label"],
+            "confidence": pred["confidence"],
+            "is_attack": pred["is_attack"],
+            "timestamp": ts.isoformat(),
+            "src_ip": payload.src_ip,
+            "dst_ip": payload.dst_ip,
+            "src_port": payload.src_port,
+            "dst_port": int(features.get("dst_port", 0)),
+            "protocol": payload.protocol,
+        }
+        results.append(result)
+        await manager.broadcast({"type": "prediction", "data": result})
+
+    has_attack = any(r["is_attack"] for r in results)
+    return {"status": "success", "processed": len(results), "has_attack": has_attack}
+
+
 @app.post("/predict/batch")
 def predict_batch(
     request: BatchPredictionRequest,

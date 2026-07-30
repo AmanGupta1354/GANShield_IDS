@@ -108,10 +108,32 @@ class IDSPredictor:
         return label, confidence, is_attack
 
     def predict_batch(self, features_list: list) -> list:
-        return [
-            {"label": lbl, "confidence": conf, "is_attack": atk}
-            for lbl, conf, atk in (self.predict(f) for f in features_list)
-        ]
+        if not features_list:
+            return []
+            
+        if self.model is None or self.encoder is None:
+            raise RuntimeError("ML model is not loaded. Check MODEL_PATH and ENCODER_PATH in config.py.")
+            
+        # Build 2D numpy array for batch
+        rows = []
+        for features in features_list:
+            rows.append([features.get(col, 0.0) for col in FEATURE_COLUMNS])
+            
+        x_batch = np.array(rows, dtype=np.float64)
+        x_batch = np.nan_to_num(x_batch, nan=0.0, posinf=1e9, neginf=-1e9)
+        
+        pred_classes = self.model.predict(x_batch)
+        probas = self.model.predict_proba(x_batch)
+        
+        results = []
+        for i, pred_class in enumerate(pred_classes):
+            pred_class = int(pred_class)
+            confidence = float(probas[i][pred_class])
+            label = self.encoder.inverse_transform([pred_class])[0]
+            is_attack = label.lower() != BENIGN_LABEL.lower()
+            results.append({"label": label, "confidence": confidence, "is_attack": is_attack})
+            
+        return results
 
     @property
     def is_ready(self) -> bool:

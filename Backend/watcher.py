@@ -7,12 +7,14 @@ import logging
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from concurrent.futures import ThreadPoolExecutor
 from config import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-API_URL = f"http://127.0.0.1:{settings.PORT}/predict/live"
+API_URL = f"http://127.0.0.1:{settings.PORT}/predict/live/batch"
+executor = ThreadPoolExecutor(max_workers=4)
 
 # Map CICFlowMeter CSV column names → our feature keys
 COLUMN_MAP = {
@@ -124,27 +126,24 @@ def process_csv_row(row: dict):
     return features, meta
 
 
-def send_to_api(features: dict, meta: dict):
-    payload = {
-        "features": features,
-        "src_ip": meta.get("src_ip"),
-        "dst_ip": meta.get("dst_ip"),
-        "src_port": int(meta.get("src_port", 0)) if meta.get("src_port") else None,
-    }
+def send_batch_to_api(payloads: list, filepath: str, handler: "CSVHandler"):
+    if not payloads:
+        return
     try:
-        resp = requests.post(API_URL, json=payload, timeout=5)
+        resp = requests.post(API_URL, json=payloads, timeout=10)
         if resp.status_code == 200:
             result = resp.json()
-            status = "🚨 ATTACK" if result["is_attack"] else "✅ Benign"
-            logger.info(f"{status} | {result['label']} ({result['confidence']:.2%})")
-            return result["is_attack"]
+            logger.info(f"✅ Batch processed: {result.get('processed', 0)} flows from {Path(filepath).name}")
+            if result.get("has_attack"):
+                handler.files_with_attacks.add(filepath)
         else:
             logger.warning(f"API error: {resp.status_code} — {resp.text[:200]}")
     except requests.ConnectionError:
         logger.error("Cannot connect to FastAPI. Is the server running?")
     except Exception as e:
         logger.error(f"Send error: {e}")
-    return False
+    finally:
+        handler._cleanup_old_files()
 
 
 def process_entire_csv(filepath: str, handler: "CSVHandler"):
@@ -155,15 +154,19 @@ def process_entire_csv(filepath: str, handler: "CSVHandler"):
         if not rows:
             return
         logger.info(f"📂 Backfilling {len(rows)} rows from {Path(filepath).name}")
-        has_attack = False
+        
+        payloads = []
         for row in rows:
             features, meta = process_csv_row(row)
-            is_attack = send_to_api(features, meta)
-            if is_attack:
-                has_attack = True
-                
-        if has_attack:
-            handler.files_with_attacks.add(filepath)
+            payloads.append({
+                "features": features,
+                "src_ip": meta.get("src_ip"),
+                "dst_ip": meta.get("dst_ip"),
+                "src_port": int(meta.get("src_port", 0)) if meta.get("src_port") else None,
+            })
+            
+        if payloads:
+            executor.submit(send_batch_to_api, payloads, filepath, handler)
             
         # Mark as fully read so the watchdog won't re-process it
         handler.processed_rows[filepath] = len(rows)
@@ -192,26 +195,28 @@ class CSVHandler(FileSystemEventHandler):
 
     def _process_new_rows(self, filepath: str):
         already_read = self.processed_rows.get(filepath, 0)
-        has_attack = False
         try:
             with open(filepath, "r", newline="", encoding="utf-8-sig") as f:
                 reader = list(csv.DictReader(f))
             new_rows = reader[already_read:]
+            
+            payloads = []
             for row in new_rows:
                 features, meta = process_csv_row(row)
-                is_attack = send_to_api(features, meta)
-                if is_attack:
-                    has_attack = True
-                    
-            if has_attack:
-                self.files_with_attacks.add(filepath)
+                payloads.append({
+                    "features": features,
+                    "src_ip": meta.get("src_ip"),
+                    "dst_ip": meta.get("dst_ip"),
+                    "src_port": int(meta.get("src_port", 0)) if meta.get("src_port") else None,
+                })
+                
+            if payloads:
+                executor.submit(send_batch_to_api, payloads, filepath, self)
                 
             self.processed_rows[filepath] = len(reader)
         except Exception as e:
             logger.error(f"CSV read error [{filepath}]: {e}")
             
-        self._cleanup_old_files()
-
     def _cleanup_old_files(self):
         import shutil
         flow_dir = Path(settings.FLOW_OUTPUT_DIR)
@@ -273,6 +278,7 @@ def start_watcher():
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
+        executor.shutdown(wait=True)
     observer.join()
 
 

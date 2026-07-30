@@ -15,7 +15,7 @@ export default defineConfig({
   },
   server: {
     watch: {
-      ignored: ['**/backend/**', '**/data/**'],
+      ignored: ['**/backend/**', '**/Backend/**', '**/data/**'],
     },
   },
 })
