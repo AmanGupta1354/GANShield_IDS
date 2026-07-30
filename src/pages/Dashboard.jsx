@@ -338,8 +338,8 @@ export default function Dashboard() {
         <SelectedFlowBar log={selectedLog} onClear={() => setSelectedLogId(null)} />
         {/* Charts & Map Row */}
         <div className="flex min-h-[300px] shrink-0 flex-col gap-2 lg:flex-row">
-          {/* Traffic AreaChart (Left - 60%) */}
-          <div className="bg-card border border-border rounded-lg p-3 lg:flex-[3] shadow-sm flex flex-col min-h-[250px]">
+          {/* Traffic AreaChart (Left - 40%) */}
+          <div className="bg-card border border-border rounded-lg p-3 lg:flex-[2] shadow-sm flex flex-col min-h-[250px]">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
                 <Activity className="w-3.5 h-3.5 text-cyan-400" /> Traffic & Threat Volume (24h)
@@ -378,8 +378,8 @@ export default function Dashboard() {
               </ResponsiveContainer>
             </div>
           </div>
-          {/* Threat Map (Right - 40%) */}
-          <div className="relative lg:flex-[2] min-h-[250px]">
+          {/* Threat Map (Right - 60%) */}
+          <div className="relative lg:flex-[3] min-h-[250px]">
             <ThreatWorldMap
               logs={enrichedLogs}
               selectedLogId={selectedLogId}
