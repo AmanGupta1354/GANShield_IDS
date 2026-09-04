@@ -38,7 +38,7 @@ function MapTooltip({ log, geo, x, y }) {
   if (!log) return null;
   return (
     <div
-      className="pointer-events-none fixed z-50 max-w-xs rounded-lg border border-primary/30 bg-card/95 px-3 py-2.5 text-xs shadow-2xl backdrop-blur-md"
+      className="pointer-events-none fixed z-[10000] max-w-xs rounded-lg border border-primary/30 bg-card/95 px-3 py-2.5 text-xs shadow-2xl backdrop-blur-md"
       style={{ left: x + 14, top: y + 14 }}
     >
       <div className="flex items-center gap-2">

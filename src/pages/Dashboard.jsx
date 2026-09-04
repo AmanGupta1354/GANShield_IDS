@@ -201,7 +201,7 @@ export default function Dashboard() {
     <div className="dashboard-grid-bg mt-16 flex h-[calc(100dvh-4rem)] flex-col overflow-hidden bg-background p-3 font-mono text-foreground md:p-4 relative">
       {/* Fullscreen Map Modal Overlay */}
       {isMapExpanded && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 p-4 md:p-12 backdrop-blur-sm">
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-background/80 p-4 md:p-12 backdrop-blur-sm">
           <div className="w-[80vw] h-[80vh] bg-card rounded-xl border border-primary/30 shadow-2xl overflow-hidden relative">
             <ThreatWorldMap
               logs={enrichedLogs}
