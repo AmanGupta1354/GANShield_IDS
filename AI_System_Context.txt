@@ -3,55 +3,65 @@
 This document provides a highly detailed breakdown of the GANShield-IDS project. It is intended to be provided as context to AI assistants to help them understand the exact architecture, algorithms, and data pipelines powering the system.
 
 ## 1. System Overview
-GANShield-IDS is a full-stack, AI-powered Intrusion Detection System (IDS) capable of capturing live network traffic, extracting features, and classifying attacks in real time. The system completely bypasses legacy Java-based tools (like CICFlowMeter) in favor of a modern, pure-Python data processing pipeline.
+GANShield-IDS is a full-stack, AI-powered Intrusion Detection System (IDS) that monitors traffic entering/leaving THIS application's own port(s) — not the whole network — extracts flow features, and classifies attacks in real time. The system completely bypasses legacy Java-based tools (like CICFlowMeter) in favor of a modern, pure-Python data processing pipeline, and runs entirely inside a single FastAPI process (no separate watcher process required).
 
-## 2. Machine Learning Algorithm & Model
+## 2. Machine Learning Algorithm & Model (UNCHANGED)
 - **Algorithm:** XGBoost Classifier.
 - **Dataset:** Trained on the CICIDS2018 dataset.
-- **Classes:** Capable of classifying 12 categories: Benign, Bot, DDoS attacks-LOIC-HTTP, DoS attacks-GoldenEye, DoS attacks-Hulk, DoS attacks-SlowHTTPTest, DoS attacks-Slowloris, FTP-BruteForce, Infilteration, SFTP-BruteForce, SQL Injection, SSH-Bruteforce.
-- **Preprocessing:** 
-  - Uses `LabelEncoder` to decode the numerical predictions back into human-readable attack labels.
-- **Inference Engine:** Managed by `backend/predictor.py` which loads the `.json` XGBoost model and `.pkl` scalers/encoders.
+- **Classes:** 12 categories: Benign, Bot, DDoS attacks-LOIC-HTTP, DoS attacks-GoldenEye, DoS attacks-Hulk, DoS attacks-SlowHTTPTest, DoS attacks-Slowloris, FTP-BruteForce, Infilteration, SFTP-BruteForce, SQL Injection, SSH-Bruteforce.
+- **Preprocessing:** `LabelEncoder` decodes numerical predictions back into human-readable attack labels.
+- **Inference Engine:** `Backend/predictor.py` loads the `.json` XGBoost model and `.pkl` label encoder, and exposes `predict()` / `predict_batch()` over a fixed 77-column feature vector (`FEATURE_COLUMNS`). This module was NOT changed when the traffic source changed — only what feeds it changed.
 
-## 3. Real-Time Packet Processing Pipeline (The Core Engine)
-The system operates asynchronously through a series of decoupled scripts watching directories:
+## 3. Traffic Source: scoped to THIS application, not the whole NIC
+The system does not sniff arbitrary network traffic. `Backend/config.py`'s `settings.MONITORED_PORTS` (default `[8000]`) defines which port(s) this app listens on, and `settings.CAPTURE_BPF_FILTER` builds a BPF filter string (e.g. `"tcp port 8000"`) from it. `Backend/packet_capture.py` passes that filter to Scapy's `sniff(..., filter=...)`, so only packets addressed to/from this app's own port(s) are ever captured — this is the mechanism behind "monitor traffic entering the website/application" rather than the whole Wi-Fi adapter.
 
-1. **Packet Capture (`backend/packet_capture.py`)**
-   - Uses the `Scapy` library (requires Npcap on Windows) to sniff raw network packets directly from the Network Interface Card (NIC).
-   - Dumps the captured packets into a `.pcap` file inside `backend/pcap_output/` periodically (e.g., every 10 seconds, giving TCP flows time to finish).
+This stays at the network-flow level deliberately: flow statistics (packet sizes, timing, TCP flags, window size) are visible on the wire regardless of TLS, so no certificate/proxy is needed to get "traffic entering the app," and the ML model's feature contract needed zero changes. What this cannot see is HTTP payload content (e.g. a SQLi string in a POST body) — that gap is covered separately by the application-layer request-logging middleware (section 5), which is NOT fed into the ML model (different, incompatible feature space) but is stored and streamed for visibility.
 
-2. **PCAP Watcher & Converter (`backend/pcap_watcher.py` & `backend/pcap_to_csv.py`)**
-   - `pcap_watcher.py` uses the `watchdog` library to monitor `backend/pcap_output/`.
-   - When a new `.pcap` file is saved, it triggers `pcap_to_csv.py` on a background thread.
-   - `pcap_to_csv.py` is a custom, pure-Python script that extracts 80+ flow statistical features (identical to the CICFlowMeter standard) from the packets.
-   - The resulting features are saved as a `.csv` file in `backend/flow_output/`.
-   - *Note: This pure-Python approach replaces the old dependency on the Java-based CICFlowMeter tool, ensuring seamless Windows compatibility without tcpdump.*
+## 4. Real-Time Packet Processing Pipeline (single process, in-memory hops)
+1. **Packet Capture (`Backend/packet_capture.py`)**
+   - Scapy sniffs, BPF-filtered to `MONITORED_PORTS`, on a background thread.
+   - Dumps captured packets into a `.pcap` file inside `Backend/pcap_output/` every `PCAP_FLUSH_INTERVAL_S` seconds (default 10s — tunable; flows still open at flush time produce 0 rows).
+   - Auto-retries with backoff on sniff errors; stops after 5 consecutive failures rather than looping silently forever.
 
-3. **CSV Watcher & Storage Optimizer (`backend/watcher.py`)**
-   - Uses `watchdog` to monitor `backend/flow_output/` for new CSV files.
-   - For every new flow row, it maps the columns to the expected model features and sends a `POST /predict/live` request to the FastAPI backend.
-   - **Storage Optimization:** To prevent disk saturation, it maintains only the last 5 generated CSV and PCAP files. 
-   - **Attack Archiving:** If a file contains a malicious flow, the CSV and corresponding PCAP are moved to `backend/attack_log/` for forensic analysis. If it is entirely benign, it is permanently deleted.
+2. **PCAP Watcher & Converter (`Backend/pcap_watcher.py` + `Backend/pcap_to_csv.py`)**
+   - `pcap_watcher.py` uses `watchdog` to monitor `Backend/pcap_output/` (in-process, same Python process as the FastAPI server).
+   - On a new `.pcap`, it calls `pcap_to_csv.pcap_to_flows()` (pure-Python, Scapy-based; no tcpdump/Java dependency) to get flow rows directly in memory, and separately writes them to `Backend/flow_output/<stem>.csv` for forensic audit.
+   - It then calls `pipeline.ingest_rows(rows)` **directly, in-process** — no disk read-back, no HTTP call.
+   - Handles rotation/archiving: keeps the last 5 pcap+csv pairs; any pair containing an attack is moved to `Backend/attack_log/`; benign pairs beyond the last 5 are deleted.
 
-## 4. Backend Architecture (FastAPI)
-- **Framework:** FastAPI running on Uvicorn.
-- **Database:** SQLite managed via SQLAlchemy ORM (`backend/database.py`).
-- **Authentication:** JWT (JSON Web Tokens) with hashed passwords (`passlib/bcrypt`) inside `backend/auth.py`.
-- **Key Endpoints:**
-  - `POST /predict/live`: Receives flow features from `watcher.py`, runs ML inference, saves the `FlowLog` to the SQLite DB, and broadcasts the result.
-  - `POST /capture/start` & `POST /capture/stop`: APIs to start/stop the `packet_capture.py` and `pcap_watcher.py` threads.
-  - `GET /stats` & `GET /logs`: Fetch historical data and aggregated analytics for the frontend dashboard.
-  - `WS /ws/live`: WebSocket endpoint for real-time frontend updates.
+3. **Ingestion Pipeline (`Backend/pipeline.py`)** — the module that replaced the old cross-process hop.
+   - Maps CICFlowMeter-style column names to the model's feature keys (`COLUMN_MAP`).
+   - Calls `predictor.predict_batch()` (unchanged ML model).
+   - Persists results as `FlowLog` rows via a fresh SQLAlchemy session (thread-safe — called from background capture threads).
+   - Broadcasts each prediction over WebSocket by scheduling the coroutine onto the FastAPI event loop via `asyncio.run_coroutine_threadsafe` (the loop reference is bound once at startup in `main.py`'s lifespan).
+   - Both `/predict/live` and `/predict/live/batch` HTTP endpoints now delegate to this same pipeline function, so there is exactly one code path from "flow features" to "predicted + persisted + broadcast."
 
-## 5. Frontend Architecture (React + Vite)
+4. **Backfill CLI (`Backend/watcher.py`)** — repurposed, NOT required to run the live system.
+   - Used to be a second, separately-run process with its own watchdog loop that POSTed to `/predict/live` over HTTP. That's gone.
+   - Now it's a one-shot CLI (`python watcher.py [dir]`) for manually reprocessing archived CSVs (e.g. files in `attack_log/`) through the same `pipeline.ingest_rows()` — useful for forensics/backfill only.
+
+## 5. Application-Layer Request Logging (separate from the ML classifier)
+- `Backend/main.py` has an ASGI middleware (`request_logging_middleware`) that records every HTTP request's method, path, status code, latency, client IP, user agent, and content length to a `RequestLog` table (`Backend/database.py`), and broadcasts it over the same `/ws/live` WebSocket as `{"type": "request", ...}`.
+- Exposed via `GET /requests/logs`.
+- This is intentionally NOT fed into the XGBoost model — the model's feature space is network-flow statistics, not HTTP metadata — but gives literal "requests hitting the site" visibility on the dashboard alongside the flow-level attack classifications.
+- `/health` and `/ws/live` are excluded from logging to avoid self-inflicted noise from health polling.
+
+## 6. Backend Architecture (FastAPI)
+- **Framework:** FastAPI running on Uvicorn — a single process for capture, inference, DB, and the API.
+- **Database:** SQLite via SQLAlchemy ORM (`Backend/database.py`). `FlowLog.is_attack`, `FlowLog.label`, and `FlowLog.timestamp` are indexed; `/stats` uses SQL aggregation (`COUNT`, `GROUP BY`) instead of loading the whole table into Python.
+- **Authentication:** JWT with hashed passwords (`passlib`/`bcrypt`) in `Backend/auth.py`. `bcrypt` must stay pinned near `3.2.2` — passlib 1.7.4's bcrypt backend probe breaks against bcrypt>=4.1's stricter 72-byte validation.
+- **Key Endpoints:** see README.md's API Reference table for the full, current list (it changed: `/requests/logs` is new, `/capture/status` now reports `bpf_filter`/`monitored_ports`).
+
+## 7. Frontend Architecture (React + Vite) — unchanged
 - **Framework:** React 19 + Vite.
-- **Styling & UI:** TailwindCSS v4, Framer Motion   (for micro-animations like spinning shields and glowing cards), and Lucide React icons.
-- **Data Visualization:** Recharts for dynamic dashboard analytics.
-- **State & Connection:** Custom hooks (`useWebSocket.js`) manage the auto-reconnecting WebSocket stream, instantly updating the UI when the backend broadcasts a new attack detection.
+- **Styling & UI:** TailwindCSS v4, Framer Motion, Lucide React icons.
+- **Data Visualization:** Recharts.
+- **State & Connection:** `useWebSocket.js` manages the auto-reconnecting WebSocket stream; the dashboard now also receives `{"type": "request", ...}` messages, not just `{"type": "prediction", ...}`.
 
-## 6. Directory Structure Context
-- `backend/model/`: Contains `xgb_IDS_model_fixed.json`, `scaler.pkl`, `encoder.pkl`.
-- `backend/pcap_output/`: Temporary holding for raw `.pcap` files.
-- `backend/flow_output/`: Temporary holding for processed `.csv` files.
-- `backend/attack_log/`: Permanent archive for `.pcap` and `.csv` files that contained attacks.
-- `backend/ganshield.db`: The SQLite database.
+## 8. Directory Structure Context
+- `Backend/model/`: `xgb_IDS_model.json`, `label_encoder.pkl` — unchanged by the traffic-source migration.
+- `Backend/pcap_output/`: rolling PCAPs, scoped to `MONITORED_PORTS` traffic only.
+- `Backend/flow_output/`: CSV audit trail of extracted flows (last 5 kept).
+- `Backend/attack_log/`: permanent archive for pcap+csv pairs that contained an attack.
+- `Backend/ganshield.db`: SQLite DB — `flow_logs`, `request_logs`, `users` tables.
+- `Backend/tests/`: pytest suite covering the BPF scoping, pipeline, PCAP parsing, and API layers.

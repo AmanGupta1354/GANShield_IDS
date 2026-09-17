@@ -25,16 +25,33 @@ class User(Base):
 class FlowLog(Base):
     __tablename__ = "flow_logs"
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    label = Column(String, nullable=False)
+    # Indexed: /stats and /logs filter/sort on these for every request.
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    label = Column(String, nullable=False, index=True)
     confidence = Column(Float, nullable=False)
-    is_attack = Column(Boolean, nullable=False)
+    is_attack = Column(Boolean, nullable=False, index=True)
     src_ip = Column(String, nullable=True)
     dst_ip = Column(String, nullable=True)
     src_port = Column(Integer, nullable=True)
     dst_port = Column(Integer, nullable=True)
     protocol = Column(String, nullable=True)
     raw_features = Column(Text, nullable=True)  # JSON string
+
+
+class RequestLog(Base):
+    """Application-layer visibility: one row per HTTP request that hit this
+    app (see the ASGI middleware in main.py). Independent of the ML flow
+    classifier — this is raw request metadata, not a prediction."""
+    __tablename__ = "request_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    method = Column(String, nullable=False)
+    path = Column(String, nullable=False)
+    status_code = Column(Integer, nullable=False)
+    duration_ms = Column(Float, nullable=False)
+    client_ip = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    content_length = Column(Integer, nullable=True)
 
 
 def init_db():

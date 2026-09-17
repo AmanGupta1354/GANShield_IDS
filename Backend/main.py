@@ -1,5 +1,6 @@
-import json
+import asyncio
 import logging
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -9,10 +10,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPExcept
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from config import settings
-from database import init_db, get_db, FlowLog, User
+from database import init_db, get_db, SessionLocal, FlowLog, RequestLog, User
 from models import (
     UserCreate, Token, PredictionResult, LivePredictionPayload,
     BatchPredictionRequest, DashboardStats, FlowFeatures, GeoBatchRequest,
@@ -23,6 +25,7 @@ from auth import (
     get_current_user, get_user_by_email,
 )
 from predictor import predictor
+from pipeline import pipeline
 from packet_capture import packet_capture
 from pcap_watcher import pcap_watcher_service
 
@@ -68,9 +71,18 @@ async def lifespan(app: FastAPI):
         logger.info("✅ ML model loaded")
     else:
         logger.warning("⚠️  ML model not loaded — prediction endpoints will return 503")
+
+    # Bind the pipeline to this running event loop so pcap_watcher (running
+    # on background threads) can broadcast predictions over WebSocket
+    # without an HTTP round-trip back into this same process.
+    pipeline.bind(asyncio.get_running_loop(), manager.broadcast)
+    logger.info(
+        f"✅ Capture scoped to app traffic — filter: '{settings.CAPTURE_BPF_FILTER}'"
+    )
     yield
     packet_capture.stop()
     pcap_watcher_service.stop()
+    pipeline.bind(None, None)
     logger.info("Server shutdown complete.")
 
 
@@ -95,6 +107,55 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+
+# ── Application-layer request logging ──────────────────────────────────────────
+# Literal "traffic entering our website" visibility at the HTTP layer,
+# independent of the network-flow ML classifier. Cheap, in-memory-batched,
+# and skips noisy/self-referential paths (websocket, health polling) so it
+# doesn't become its own bottleneck under load.
+_REQUEST_LOG_SKIP_PATHS = {"/health", "/ws/live"}
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    if request.url.path not in _REQUEST_LOG_SKIP_PATHS:
+        duration_ms = (time.perf_counter() - start) * 1000
+        client_ip = request.client.host if request.client else None
+        record = {
+            "timestamp": datetime.now(timezone.utc),
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": round(duration_ms, 2),
+            "client_ip": client_ip,
+            "user_agent": request.headers.get("user-agent"),
+            "content_length": int(response.headers.get("content-length") or 0) or None,
+        }
+        await _persist_request_log(record)
+    return response
+
+
+async def _persist_request_log(record: dict):
+    """A single SQLite insert + WS broadcast — cheap enough to await inline.
+    Deliberately not fire-and-forget: an unawaited task queue would grow
+    unbounded under sustained load, trading a latency micro-optimization
+    for a memory-growth bug."""
+    try:
+        db = SessionLocal()
+        try:
+            db.add(RequestLog(**record))
+            db.commit()
+        finally:
+            db.close()
+        await manager.broadcast({"type": "request", "data": {
+            **{k: v for k, v in record.items() if k != "timestamp"},
+            "timestamp": record["timestamp"].isoformat(),
+        }})
+    except Exception:
+        logger.exception("Failed to persist request log")
 
 
 # FIXED: Global exception handler — unhandled 500s now return JSON with CORS
@@ -157,105 +218,41 @@ def get_me(current_user: User = Depends(get_current_user)):
 
 # ── Prediction Routes ──────────────────────────────────────────────────────────
 
-@app.post("/predict/live")
-async def predict_live(payload: LivePredictionPayload, db: Session = Depends(get_db)):
-    if not predictor.is_ready:
-        raise HTTPException(status_code=503, detail="ML model not loaded")
-
-    features = payload.features.model_dump()
-    label, confidence, is_attack = predictor.predict(features)
-    ts = datetime.now(timezone.utc)
-
-    log = FlowLog(
-        timestamp=ts,
-        label=label,
-        confidence=confidence,
-        is_attack=is_attack,
-        src_ip=payload.src_ip,
-        dst_ip=payload.dst_ip,
-        src_port=payload.src_port,
-        dst_port=int(features.get("dst_port", 0)),
-        protocol=payload.protocol,
-        raw_features=json.dumps(features),
-    )
-    db.add(log)
-    db.commit()
-
-    result = {
-        "id": log.id,
-        "label": label,
-        "confidence": confidence,
-        "is_attack": is_attack,
-        "timestamp": ts.isoformat(),
-        "src_ip": payload.src_ip,
-        "dst_ip": payload.dst_ip,
-        "src_port": payload.src_port,
-        "dst_port": int(features.get("dst_port", 0)),
-        "protocol": payload.protocol,
+def _payload_to_dict(p: LivePredictionPayload) -> dict:
+    return {
+        "features": p.features.model_dump(),
+        "src_ip": p.src_ip,
+        "dst_ip": p.dst_ip,
+        "src_port": p.src_port,
+        "dst_port_info": p.dst_port_info,
+        "protocol": p.protocol,
     }
 
-    await manager.broadcast({"type": "prediction", "data": result})
+
+@app.post("/predict/live")
+async def predict_live(payload: LivePredictionPayload):
+    if not predictor.is_ready:
+        raise HTTPException(status_code=503, detail="ML model not loaded")
+    result = await asyncio.to_thread(
+        pipeline.ingest_payloads, [_payload_to_dict(payload)], "http"
+    )
+    if result["processed"] == 0:
+        raise HTTPException(status_code=503, detail="Prediction failed")
     return result
 
 
 @app.post("/predict/live/batch")
-async def predict_live_batch(payloads: List[LivePredictionPayload], db: Session = Depends(get_db)):
+async def predict_live_batch(payloads: List[LivePredictionPayload]):
     if not predictor.is_ready:
         raise HTTPException(status_code=503, detail="ML model not loaded")
-
     if not payloads:
         return {"status": "empty", "processed": 0}
-
-    features_list = [p.features.model_dump() for p in payloads]
-    predictions = predictor.predict_batch(features_list)
-    ts = datetime.now(timezone.utc)
-    
-    logs = []
-    results = []
-    
-    for i, payload in enumerate(payloads):
-        features = features_list[i]
-        pred = predictions[i]
-        
-        log = FlowLog(
-            timestamp=ts,
-            label=pred["label"],
-            confidence=pred["confidence"],
-            is_attack=pred["is_attack"],
-            src_ip=payload.src_ip,
-            dst_ip=payload.dst_ip,
-            src_port=payload.src_port,
-            dst_port=int(features.get("dst_port", 0)),
-            protocol=payload.protocol,
-            raw_features=json.dumps(features),
-        )
-        logs.append(log)
-        
-    db.add_all(logs)
-    db.commit()
-    
-    for i, log in enumerate(logs):
-        pred = predictions[i]
-        payload = payloads[i]
-        features = features_list[i]
-        
-        result = {
-            "id": log.id,
-            "label": pred["label"],
-            "confidence": pred["confidence"],
-            "is_attack": pred["is_attack"],
-            "timestamp": ts.isoformat(),
-            "src_ip": payload.src_ip,
-            "dst_ip": payload.dst_ip,
-            "src_port": payload.src_port,
-            "dst_port": int(features.get("dst_port", 0)),
-            "protocol": payload.protocol,
-        }
-        results.append(result)
-        await manager.broadcast({"type": "prediction", "data": result})
-
-    has_attack = any(r["is_attack"] for r in results)
-    return {"status": "success", "processed": len(results), "has_attack": has_attack}
+    # Run off the event loop: predictor.predict_batch + DB writes are
+    # blocking (CPU/IO) and would otherwise stall every other request.
+    result = await asyncio.to_thread(
+        pipeline.ingest_payloads, [_payload_to_dict(p) for p in payloads], "http"
+    )
+    return result
 
 
 @app.post("/predict/batch")
@@ -288,15 +285,32 @@ def get_stats(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    logs = db.query(FlowLog).all()
-    total = len(logs)
-    attacks = [l for l in logs if l.is_attack]
-    benign = total - len(attacks)
+    # Aggregate in SQL instead of loading the whole flow_logs table into
+    # Python on every dashboard poll — this used to be O(n) memory/CPU per
+    # request and got worse every time a new flow was logged.
+    total = db.query(func.count(FlowLog.id)).scalar() or 0
+    total_attacks = (
+        db.query(func.count(FlowLog.id)).filter(FlowLog.is_attack == True).scalar() or 0  # noqa: E712
+    )
+    total_benign = total - total_attacks
 
-    from collections import Counter
-    label_counts = Counter(l.label for l in attacks)
-    top_attacks = [{"label": k, "count": v} for k, v in label_counts.most_common(5)]
+    top_rows = (
+        db.query(FlowLog.label, func.count(FlowLog.id).label("cnt"))
+        .filter(FlowLog.is_attack == True)  # noqa: E712
+        .group_by(FlowLog.label)
+        .order_by(func.count(FlowLog.id).desc())
+        .limit(5)
+        .all()
+    )
+    top_attacks = [{"label": label, "count": cnt} for label, cnt in top_rows]
 
+    recent = (
+        db.query(FlowLog)
+        .filter(FlowLog.is_attack == True)  # noqa: E712
+        .order_by(FlowLog.timestamp.desc())
+        .limit(20)
+        .all()
+    )
     recent_alerts = [
         {
             "id": log.id,
@@ -306,17 +320,48 @@ def get_stats(
             "src_ip": log.src_ip,
             "dst_ip": log.dst_ip,
         }
-        for log in sorted(attacks, key=lambda x: x.timestamp, reverse=True)[:20]
+        for log in recent
     ]
 
     return DashboardStats(
         total_flows=total,
-        total_attacks=len(attacks),
-        total_benign=benign,
-        attack_rate=len(attacks) / total if total > 0 else 0.0,
+        total_attacks=total_attacks,
+        total_benign=total_benign,
+        attack_rate=(total_attacks / total) if total > 0 else 0.0,
         top_attacks=top_attacks,
         recent_alerts=recent_alerts,
     )
+
+
+# ── Application-layer traffic logs ─────────────────────────────────────────────
+
+@app.get("/requests/logs")
+def get_request_logs(
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    limit = max(1, min(limit, 1000))
+    logs = (
+        db.query(RequestLog)
+        .order_by(RequestLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "timestamp": r.timestamp.isoformat(),
+            "method": r.method,
+            "path": r.path,
+            "status_code": r.status_code,
+            "duration_ms": r.duration_ms,
+            "client_ip": r.client_ip,
+            "user_agent": r.user_agent,
+            "content_length": r.content_length,
+        }
+        for r in logs
+    ]
 
 
 @app.get("/logs")
@@ -378,9 +423,15 @@ def start_capture(
     current_user: User = Depends(get_current_user),
 ):
     packet_capture.interface = interface or settings.CAPTURE_INTERFACE
+    packet_capture.bpf_filter = settings.CAPTURE_BPF_FILTER
     packet_capture.start()
     pcap_watcher_service.start()
-    return {"status": "started", "interface": packet_capture.interface}
+    return {
+        "status": "started",
+        "interface": packet_capture.interface,
+        "bpf_filter": packet_capture.bpf_filter,
+        "monitored_ports": settings.MONITORED_PORTS,
+    }
 
 
 @app.post("/capture/stop")
@@ -397,6 +448,8 @@ def capture_status(current_user: User = Depends(get_current_user)):
         "pcap_watcher": pcap_watcher_service.is_running(),
         "interface": packet_capture.interface,
         "available_interfaces": packet_capture.get_interfaces(),
+        "bpf_filter": packet_capture.bpf_filter,
+        "monitored_ports": settings.MONITORED_PORTS,
     }
 
 

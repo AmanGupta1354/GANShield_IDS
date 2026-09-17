@@ -1,5 +1,6 @@
 import threading
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 from scapy.all import sniff, wrpcap, IFACES
@@ -29,22 +30,28 @@ def resolve_interface(iface: str) -> str:
 
 class PacketCapture:
     """
-    Captures live packets from NIC using Scapy.
-    Dumps PCAP files every `interval` seconds so CICFlowMeter can process them.
+    Captures live packets from a NIC using Scapy, scoped to the ports this
+    application listens on via a BPF filter (settings.CAPTURE_BPF_FILTER) —
+    i.e. it monitors traffic entering/leaving THIS app, not the whole NIC.
+    Dumps PCAP files every `interval` seconds so the flow extractor can
+    process them.
 
-    Why 60s?  CICFlowMeter only outputs a flow row once the flow is COMPLETE
-    (TCP FIN/RST seen, or flow timeout). With a 10-second window most flows
-    are still open when the PCAP is flushed → cicflowmeter produces 0 rows.
-    60 seconds gives the majority of short-lived flows time to finish.
+    Why not flush more often?  A flow row is only produced once the flow is
+    COMPLETE (TCP FIN/RST seen, or timeout). Flushing too often means most
+    flows are still open when the PCAP is written -> 0 rows extracted.
+    ~10s is a reasonable balance for short-lived HTTP flows; tune via
+    settings.PCAP_FLUSH_INTERVAL_S if flows are being cut short.
     """
 
-    def __init__(self, interface: str = None, interval: int = 10):
+    def __init__(self, interface: str = None, interval: int = None, bpf_filter: str = None):
         self.interface = interface or settings.CAPTURE_INTERFACE
-        self.interval = interval
+        self.interval = interval or settings.PCAP_FLUSH_INTERVAL_S
+        self.bpf_filter = bpf_filter or settings.CAPTURE_BPF_FILTER
         self.running = False
         self.thread: threading.Thread = None
         self.packets = []
         self.lock = threading.Lock()
+        self._consecutive_errors = 0
         Path(settings.CAPTURE_PCAP_DIR).mkdir(parents=True, exist_ok=True)
 
     def _packet_handler(self, pkt):
@@ -67,13 +74,28 @@ class PacketCapture:
 
     def _capture_loop(self):
         while self.running:
-            sniff(
-                iface=self.interface,
-                prn=self._packet_handler,
-                store=False,
-                timeout=self.interval,
-                stop_filter=lambda p: not self.running,
-            )
+            try:
+                sniff(
+                    iface=self.interface,
+                    filter=self.bpf_filter,
+                    prn=self._packet_handler,
+                    store=False,
+                    timeout=self.interval,
+                    stop_filter=lambda p: not self.running,
+                )
+                self._consecutive_errors = 0
+            except Exception:
+                self._consecutive_errors += 1
+                logger.exception(
+                    "Packet capture error on interface %s (attempt %d)",
+                    self.interface, self._consecutive_errors,
+                )
+                if self._consecutive_errors >= 5:
+                    logger.error("Too many consecutive capture errors — stopping capture.")
+                    self.running = False
+                    break
+                time.sleep(min(2 ** self._consecutive_errors, 30))
+                continue
             self._flush_pcap()
 
     def start(self):
@@ -82,11 +104,12 @@ class PacketCapture:
             return
         self.interface = resolve_interface(self.interface)
         self.running = True
+        self._consecutive_errors = 0
         self.thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.thread.start()
         logger.info(
             f"Packet capture started on interface: {self.interface} "
-            f"(flush every {self.interval}s)"
+            f"| filter: '{self.bpf_filter}' | flush every {self.interval}s"
         )
 
     def stop(self):

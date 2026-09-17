@@ -143,7 +143,15 @@ def _to_row(key, fd):
         "Idle Max": max(idl,default=0), "Idle Min": min(idl,default=0),
     }
 
-def pcap_to_csv(pcap_path: str, csv_path: str) -> int:
+def pcap_to_flows(pcap_path, bpf_ports=None) -> list:
+    """Parse a PCAP into CICFlowMeter-style flow rows (list of dicts).
+
+    bpf_ports: optional iterable of ports — packets where neither the src
+    nor dst port is in this set are skipped. Capture-time BPF filtering
+    already scopes what lands in the PCAP; this is a cheap defense-in-depth
+    filter for PCAPs captured (or replayed) without one.
+    """
+    ports = set(bpf_ports) if bpf_ports else None
     flows = {}
     with PcapReader(str(pcap_path)) as reader:
         for pkt in reader:
@@ -160,6 +168,8 @@ def pcap_to_csv(pcap_path: str, csv_path: str) -> int:
                 th = (t.dataofs or 5)*4; payload = len(t.payload)
             elif UDP in pkt:
                 u = pkt[UDP]; sp,dp = u.sport,u.dport; uh = 8; payload = len(u.payload)
+            if ports is not None and sp not in ports and dp not in ports:
+                continue
             plen = len(pkt)
             ts = int(float(pkt.time)*1_000_000)
             fk = (sip, dip, sp, dp, proto)
@@ -172,9 +182,18 @@ def pcap_to_csv(pcap_path: str, csv_path: str) -> int:
                 flows[key] = _new_flow(*key); fd = flows[key]; is_fwd = True
             _update(fd, is_fwd, plen, payload, ih+th+uh, flags, win, ts)
 
-    rows = [r for r in (_to_row(k,v) for k,v in flows.items()) if r]
+    return [r for r in (_to_row(k, v) for k, v in flows.items()) if r]
+
+
+def write_flows_csv(rows: list, csv_path: str) -> int:
     Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         w.writeheader(); w.writerows(rows)
     return len(rows)
+
+
+def pcap_to_csv(pcap_path: str, csv_path: str) -> int:
+    """Back-compat wrapper: parse + write CSV. Prefer pcap_to_flows() when
+    the rows are also needed in-process (avoids a disk round-trip)."""
+    return write_flows_csv(pcap_to_flows(pcap_path), csv_path)
